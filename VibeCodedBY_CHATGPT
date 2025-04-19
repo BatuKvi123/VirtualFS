@@ -1,108 +1,111 @@
--- VFS API Script
 local VirtualFS = {}
 
 VirtualFS._files = {}
-VirtualFS._openFiles = {}
-VirtualFS._events = {}
 VirtualFS._directories = {}
+VirtualFS._openHandles = {}
+VirtualFS._events = {}
 
-function VirtualFS:AddEventListener(eventType, callback)
-    self._events[eventType] = self._events[eventType] or {}
-    table.insert(self._events[eventType], callback)
+-- Event System
+function VirtualFS:AddEventListener(event, callback)
+	if not self._events[event] then
+		self._events[event] = {}
+	end
+	table.insert(self._events[event], callback)
 end
 
-function VirtualFS:_TriggerFileEvent(eventType, filename)
-    local events = self._events[eventType]
-    if not events then return end
-    for _, callback in ipairs(events) do
-        callback(filename)
-    end
+function VirtualFS:_TriggerEvent(event, filename)
+	local list = self._events[event]
+	if list then
+		for _, cb in ipairs(list) do
+			cb(filename)
+		end
+	end
 end
 
+-- Directory
 function VirtualFS:CreateDirectory(name)
-    if self._directories[name] then error("Directory already exists: " .. name) end
-    self._directories[name] = {}
+	if self._directories[name] then
+		error("Directory already exists: " .. name)
+	end
+	self._directories[name] = {}
 end
 
-function VirtualFS:CreateFile(filename, dir)
-    if dir then
-        if not self._directories[dir] then error("Directory does not exist: " .. dir) end
-        if self._directories[dir][filename] then error("File already exists in directory: " .. filename) end
-        self._directories[dir][filename] = ""
-    else
-        if self._files[filename] then error("File already exists: " .. filename) end
-        self._files[filename] = ""
-    end
-    self:_TriggerFileEvent("create", filename)
+-- File
+function VirtualFS:CreateFile(name, dir)
+	if dir then
+		local d = self._directories[dir]
+		if not d then error("Directory not found: " .. dir) end
+		if d[name] then error("File already exists in directory: " .. name) end
+		d[name] = ""
+	else
+		if self._files[name] then error("File already exists: " .. name) end
+		self._files[name] = ""
+	end
+	self:_TriggerEvent("create", name)
 end
 
-function VirtualFS:OpenFile(filename, mode, dir)
-    if mode ~= "w" and mode ~= "r" then error("Invalid mode: " .. mode) end
-
-    local content = dir and self._directories[dir] or self._files
-    if not content then error("Directory does not exist: " .. (dir or "root")) end
-    if not content[filename] then error("File not found: " .. filename) end
-
-    local handle = {
-        name = filename,
-        mode = mode,
-        dir = dir,
-        type = "virtual_file_handle"
-    }
-    self._openFiles[filename] = handle
-    return handle
+function VirtualFS:OpenFile(name, mode, dir)
+	if mode ~= "w" and mode ~= "r" then
+		error("Invalid mode (use 'r' or 'w')")
+	end
+	local content = dir and self._directories[dir] or self._files
+	if not content or not content[name] then
+		error("File not found: " .. name)
+	end
+	local handle = {
+		name = name,
+		mode = mode,
+		dir = dir
+	}
+	self._openHandles[name] = handle
+	return handle
 end
 
-function VirtualFS:WriteToFile(file, data)
-    if file.mode ~= "w" then error("File not opened in write mode") end
-
-    local store = file.dir and self._directories[file.dir] or self._files
-    store[file.name] = (store[file.name] or "") .. data
-    self:_TriggerFileEvent("modify", file.name)
+function VirtualFS:WriteToFile(handle, text)
+	if handle.mode ~= "w" then error("File not opened in write mode") end
+	local target = handle.dir and self._directories[handle.dir] or self._files
+	target[handle.name] = (target[handle.name] or "") .. text
+	self:_TriggerEvent("modify", handle.name)
 end
 
-function VirtualFS:ReadFromFile(file)
-    local store = file.dir and self._directories[file.dir] or self._files
-    return store[file.name]
+function VirtualFS:ReadFromFile(handle)
+	local target = handle.dir and self._directories[handle.dir] or self._files
+	return target[handle.name]
 end
 
-function VirtualFS:CloseFile(file)
-    self._openFiles[file.name] = nil
+function VirtualFS:CloseFile(handle)
+	self._openHandles[handle.name] = nil
 end
 
-function VirtualFS:DeleteFile(filename, dir)
-    local store = dir and self._directories[dir] or self._files
-    if not store[filename] then error("File not found: " .. filename) end
-    store[filename] = nil
-    self:_TriggerFileEvent("delete", filename)
+function VirtualFS:DeleteFile(name, dir)
+	local target = dir and self._directories[dir] or self._files
+	if not target or not target[name] then
+		error("File not found: " .. name)
+	end
+	target[name] = nil
+	self:_TriggerEvent("delete", name)
 end
 
 function VirtualFS:ListFiles(dir)
-    local store = dir and self._directories[dir] or self._files
-    if not store then error("Directory does not exist: " .. (dir or "root")) end
-
-    local results = {}
-    for name in pairs(store) do
-        table.insert(results, name)
-    end
-    return results
+	local target = dir and self._directories[dir] or self._files
+	local list = {}
+	for k in pairs(target) do
+		table.insert(list, k)
+	end
+	return list
 end
 
-function VirtualFS:ImportFile(filename, dir)
-    local code
-    if dir then
-        code = self._directories[dir] and self._directories[dir][filename]
-    else
-        code = self._files[filename]
-    end
-    if not code then error("File does not exist: " .. filename) end
+-- Import (module-style)
+function VirtualFS:ImportFile(name, dir)
+	local target = dir and self._directories[dir] or self._files
+	local code = target[name]
+	if not code then error("File does not exist: " .. name) end
 
-    local env = setmetatable({}, { __index = _G })
-    local chunk, err = load("return function()\n" .. code .. "\nend", filename, "t", env)
-    if not chunk then error("Load error: " .. err) end
-
-    local fn = chunk()
-    return fn()
+	local env = setmetatable({}, { __index = _G })
+	local chunk, err = load(code, name, "t", env)
+	if not chunk then error("Import error: " .. err) end
+	local result = chunk()
+	return result or true
 end
 
 return VirtualFS
