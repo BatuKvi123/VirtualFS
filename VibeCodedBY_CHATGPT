@@ -1,3 +1,4 @@
+-- VFS API Script
 local VirtualFS = {}
 
 VirtualFS._files = {}
@@ -6,158 +7,102 @@ VirtualFS._events = {}
 VirtualFS._directories = {}
 
 function VirtualFS:AddEventListener(eventType, callback)
- if not self._events[eventType] then
-  self._events[eventType] = {}
- end
- table.insert(self._events[eventType], callback)
+    self._events[eventType] = self._events[eventType] or {}
+    table.insert(self._events[eventType], callback)
 end
 
 function VirtualFS:_TriggerFileEvent(eventType, filename)
- if not self._events[eventType] then return end
- for _, callback in ipairs(self._events[eventType]) do
-  callback(filename)
- end
+    local events = self._events[eventType]
+    if not events then return end
+    for _, callback in ipairs(events) do
+        callback(filename)
+    end
 end
 
-function VirtualFS:CreateDirectory(dirName)
- if self._directories[dirName] then
-  error("Directory already exists: " .. dirName)
- end
- self._directories[dirName] = {}
+function VirtualFS:CreateDirectory(name)
+    if self._directories[name] then error("Directory already exists: " .. name) end
+    self._directories[name] = {}
 end
 
-function VirtualFS:CreateFile(filename, dirName)
- if dirName then
-  if not self._directories[dirName] then
-   error("Directory does not exist: " .. dirName)
-  end
-  if self._directories[dirName][filename] then
-   error("File already exists in directory: " .. filename)
-  end
-  self._directories[dirName][filename] = ""
- else
-  if self._files[filename] then
-   error("File already exists: " .. filename)
-  end
-  self._files[filename] = ""
- end
- self:_TriggerFileEvent("create", filename)
+function VirtualFS:CreateFile(filename, dir)
+    if dir then
+        if not self._directories[dir] then error("Directory does not exist: " .. dir) end
+        if self._directories[dir][filename] then error("File already exists in directory: " .. filename) end
+        self._directories[dir][filename] = ""
+    else
+        if self._files[filename] then error("File already exists: " .. filename) end
+        self._files[filename] = ""
+    end
+    self:_TriggerFileEvent("create", filename)
 end
 
-function VirtualFS:OpenFile(filename, mode, dirName)
- if not mode then error("Mode is required") end
- local content
- if dirName then
-  if not self._directories[dirName] then
-   error("Directory does not exist: " .. dirName)
-  end
-  if not self._directories[dirName][filename] then
-   error("File not found in directory: " .. filename)
-  end
-  content = self._directories[dirName][filename]
- else
-  if not self._files[filename] then
-   error("File not found: " .. filename)
-  end
-  content = self._files[filename]
- end
+function VirtualFS:OpenFile(filename, mode, dir)
+    if mode ~= "w" and mode ~= "r" then error("Invalid mode: " .. mode) end
 
- local file = {
-  name = filename,
-  mode = mode,
-  dirName = dirName,
-  Write = function(self, data)
-   if not self.mode:match("w") then
-    error("File not opened in write mode")
-   end
-   if self.dirName then
-    VirtualFS._directories[self.dirName][self.name] = VirtualFS._directories[self.dirName][self.name] .. data
-   else
-    VirtualFS._files[self.name] = VirtualFS._files[self.name] .. data
-   end
-   VirtualFS:_TriggerFileEvent("modify", self.name)
-  end,
-  Read = function(self)
-   if not self.mode:match("r") then
-    error("File not opened in read mode")
-   end
-   if self.dirName then
-    return VirtualFS._directories[self.dirName][self.name]
-   else
-    return VirtualFS._files[self.name]
-   end
-  end,
-  SetMode = function(self, newMode)
-   self.mode = newMode
-  end,
-  Close = function(self)
-   VirtualFS._openFiles[self.name] = nil
-  end,
-  __tostring = function(self)
-   return self:Read()
-  end
- }
+    local content = dir and self._directories[dir] or self._files
+    if not content then error("Directory does not exist: " .. (dir or "root")) end
+    if not content[filename] then error("File not found: " .. filename) end
 
- self._openFiles[filename] = file
- return file
+    local handle = {
+        name = filename,
+        mode = mode,
+        dir = dir,
+        type = "virtual_file_handle"
+    }
+    self._openFiles[filename] = handle
+    return handle
 end
 
-function VirtualFS:DeleteFile(filename, dirName)
- if dirName then
-  if not self._directories[dirName] then
-   error("Directory does not exist: " .. dirName)
-  end
-  if not self._directories[dirName][filename] then
-   error("File not found in directory: " .. filename)
-  end
-  self._directories[dirName][filename] = nil
- else
-  if not self._files[filename] then
-   error("File not found: " .. filename)
-  end
-  self._files[filename] = nil
- end
- self:_TriggerFileEvent("delete", filename)
+function VirtualFS:WriteToFile(file, data)
+    if file.mode ~= "w" then error("File not opened in write mode") end
+
+    local store = file.dir and self._directories[file.dir] or self._files
+    store[file.name] = (store[file.name] or "") .. data
+    self:_TriggerFileEvent("modify", file.name)
 end
 
-function VirtualFS:ListFiles(dirName)
- local result = {}
- if dirName then
-  if not self._directories[dirName] then
-   error("Directory does not exist: " .. dirName)
-  end
-  for filename in pairs(self._directories[dirName]) do
-   table.insert(result, filename)
-  end
- else
-  for filename in pairs(self._files) do
-   table.insert(result, filename)
-  end
- end
- return result
+function VirtualFS:ReadFromFile(file)
+    local store = file.dir and self._directories[file.dir] or self._files
+    return store[file.name]
 end
 
-function VirtualFS:ImportFile(filename, dirName)
- local code
- if dirName then
-  code = self._directories[dirName][filename]
- else
-  code = self._files[filename]
- end
- if not code then error("File doesn't exist: " .. filename) end
+function VirtualFS:CloseFile(file)
+    self._openFiles[file.name] = nil
+end
 
- local moduleEnv = {}
- setmetatable(moduleEnv, { __index = _G })
- local chunk, err = load("return function()\n" .. code .. "\nend", filename, "t", moduleEnv)
- if not chunk then error("Import load error: " .. err) end
+function VirtualFS:DeleteFile(filename, dir)
+    local store = dir and self._directories[dir] or self._files
+    if not store[filename] then error("File not found: " .. filename) end
+    store[filename] = nil
+    self:_TriggerFileEvent("delete", filename)
+end
 
- local loader = chunk()
- local results = loader()
- if type(results) == "table" then
-  return results
- else
-  return moduleEnv
- end
+function VirtualFS:ListFiles(dir)
+    local store = dir and self._directories[dir] or self._files
+    if not store then error("Directory does not exist: " .. (dir or "root")) end
+
+    local results = {}
+    for name in pairs(store) do
+        table.insert(results, name)
+    end
+    return results
+end
+
+function VirtualFS:ImportFile(filename, dir)
+    local code
+    if dir then
+        code = self._directories[dir] and self._directories[dir][filename]
+    else
+        code = self._files[filename]
+    end
+    if not code then error("File does not exist: " .. filename) end
+
+    local env = setmetatable({}, { __index = _G })
+    local chunk, err = load("return function()\n" .. code .. "\nend", filename, "t", env)
+    if not chunk then error("Load error: " .. err) end
+
+    local fn = chunk()
+    return fn()
 end
 
 return VirtualFS
