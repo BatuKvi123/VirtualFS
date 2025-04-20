@@ -1,111 +1,160 @@
-local VirtualFS = {}
+local MiniVM = {
+    root = {},
+    metadata = {}
+}
 
-VirtualFS._files = {}
-VirtualFS._directories = {}
-VirtualFS._openHandles = {}
-VirtualFS._events = {}
-
--- Event System
-function VirtualFS:AddEventListener(event, callback)
-	if not self._events[event] then
-		self._events[event] = {}
-	end
-	table.insert(self._events[event], callback)
+local function splitPath(path)
+    local parts = {}
+    for part in string.gmatch(path, "[^/]+") do
+        table.insert(parts, part)
+    end
+    return parts
 end
 
-function VirtualFS:_TriggerEvent(event, filename)
-	local list = self._events[event]
-	if list then
-		for _, cb in ipairs(list) do
-			cb(filename)
-		end
-	end
+local function getFolder(vm, path)
+    local parts = splitPath(path)
+    local current = vm.root
+    for i = 1, #parts - 1 do
+        local part = parts[i]
+        if type(current[part]) ~= "table" then
+            return nil, "Folder not found: " .. part
+        end
+        current = current[part]
+    end
+    return current, parts[#parts]
 end
 
--- Directory
-function VirtualFS:CreateDirectory(name)
-	if self._directories[name] then
-		error("Directory already exists: " .. name)
-	end
-	self._directories[name] = {}
+function MiniVM:CreateFolder(path)
+    local parent, name = getFolder(self, path)
+    if not parent then return false, name end
+    if parent[name] then return false, "Already exists" end
+    parent[name] = {}
+    return true, "Folder created"
 end
 
--- File
-function VirtualFS:CreateFile(name, dir)
-	if dir then
-		local d = self._directories[dir]
-		if not d then error("Directory not found: " .. dir) end
-		if d[name] then error("File already exists in directory: " .. name) end
-		d[name] = ""
-	else
-		if self._files[name] then error("File already exists: " .. name) end
-		self._files[name] = ""
-	end
-	self:_TriggerEvent("create", name)
+function MiniVM:CreateFile(path, content)
+    local parent, name = getFolder(self, path)
+    if not parent then return false, name end
+    if parent[name] then return false, "Already exists" end
+    parent[name] = content or ""
+    self.metadata[path] = {
+        created = os.time(),
+        size = #content,
+        type = "lua/script",
+    }
+    return true, "File created"
 end
 
-function VirtualFS:OpenFile(name, mode, dir)
-	if mode ~= "w" and mode ~= "r" then
-		error("Invalid mode (use 'r' or 'w')")
-	end
-	local content = dir and self._directories[dir] or self._files
-	if not content or not content[name] then
-		error("File not found: " .. name)
-	end
-	local handle = {
-		name = name,
-		mode = mode,
-		dir = dir
-	}
-	self._openHandles[name] = handle
-	return handle
+function MiniVM:SetFileMetadata(path, data)
+    self.metadata[path] = data
 end
 
-function VirtualFS:WriteToFile(handle, text)
-	if handle.mode ~= "w" then error("File not opened in write mode") end
-	local target = handle.dir and self._directories[handle.dir] or self._files
-	target[handle.name] = (target[handle.name] or "") .. text
-	self:_TriggerEvent("modify", handle.name)
+function MiniVM:GetFileMetadata(path)
+    return self.metadata[path]
 end
 
-function VirtualFS:ReadFromFile(handle)
-	local target = handle.dir and self._directories[handle.dir] or self._files
-	return target[handle.name]
+function MiniVM:ReadFile(path)
+    local parent, name = getFolder(self, path)
+    if not parent or type(parent[name]) ~= "string" then
+        return nil, "File not found"
+    end
+    return parent[name]
 end
 
-function VirtualFS:CloseFile(handle)
-	self._openHandles[handle.name] = nil
+function MiniVM:WriteFile(path, content)
+    local parent, name = getFolder(self, path)
+    if not parent or type(parent[name]) ~= "string" then
+        return false, "File not found"
+    end
+    parent[name] = content
+    if self.metadata[path] then
+        self.metadata[path].size = #content
+    end
+    return true, "File written"
 end
 
-function VirtualFS:DeleteFile(name, dir)
-	local target = dir and self._directories[dir] or self._files
-	if not target or not target[name] then
-		error("File not found: " .. name)
-	end
-	target[name] = nil
-	self:_TriggerEvent("delete", name)
+function MiniVM:DeleteFile(path)
+    local parent, name = getFolder(self, path)
+    if not parent or not parent[name] then
+        return false, "File or folder not found"
+    end
+    parent[name] = nil
+    self.metadata[path] = nil
+    return true, "Deleted"
 end
 
-function VirtualFS:ListFiles(dir)
-	local target = dir and self._directories[dir] or self._files
-	local list = {}
-	for k in pairs(target) do
-		table.insert(list, k)
-	end
-	return list
+function MiniVM:ListFolder(path)
+    local folder = self.root
+    if path and path ~= "" then
+        local parent, name = getFolder(self, path)
+        if not parent or type(parent[name]) ~= "table" then
+            return nil, "Folder not found"
+        end
+        folder = parent[name]
+    end
+
+    local list = {}
+    for k, v in pairs(folder) do
+        table.insert(list, type(v) == "table" and (k .. "/") or k)
+    end
+    return list
 end
 
--- Import (module-style)
-function VirtualFS:ImportFile(name, dir)
-	local target = dir and self._directories[dir] or self._files
-	local code = target[name]
-	if not code then error("File does not exist: " .. name) end
+function MiniVM:Import(path)
+    local code, err = self:ReadFile(path)
+    if not code then return nil, err end
 
-	local env = setmetatable({}, { __index = _G })
-	local chunk, err = load(code, name, "t", env)
-	if not chunk then error("Import error: " .. err) end
-	local result = chunk()
-	return result or true
+    local wrapped = "return {\n" .. code .. "\n}"
+    local env = setmetatable({}, { __index = _G })
+    local chunk, loadErr = loadstring(wrapped, path, "t", env)
+    if not chunk then
+        return nil, "Error loading code: " .. tostring(loadErr)
+    end
+
+    local ok, result = pcall(chunk)
+    if not ok then
+        return nil, "Runtime error: " .. tostring(result)
+    end
+
+    return result
 end
 
-return VirtualFS
+function MiniVM:RunCommand(cmd)
+    print("> " .. cmd)
+    local args = {}
+    for word in string.gmatch(cmd, "[^%s]+") do
+        table.insert(args, word)
+    end
+    local command = args[1]
+
+    if command == "ls" then
+        local folder = args[2] or ""
+        local files = self:ListFolder(folder)
+        if files then
+            for _, f in ipairs(files) do print(f) end
+        else
+            print("Folder not found")
+        end
+
+    elseif command == "cat" then
+        local file = args[2]
+        local content = self:ReadFile(file)
+        print(content or "File not found")
+
+    elseif command == "run" then
+        local file = args[2]
+        local result, err = self:Import(file)
+        if result then
+            print("Module loaded. Functions:")
+            for k, v in pairs(result) do
+                print("  " .. tostring(k))
+            end
+        else
+            print("Error:", err)
+        end
+    else
+        print("Unknown command:", command)
+    end
+end
+
+return MiniVM
